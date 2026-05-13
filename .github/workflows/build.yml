@@ -1,0 +1,31 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller pygame librosa numpy scipy soundfile numba llvmlite
+
+    - name: Build EXE
+      run: |
+        pyinstaller --onedir --noconsole --name RhythmGame rhythm_game.py
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: RhythmGame-Windows
+        path: dist/
