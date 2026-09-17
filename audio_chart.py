@@ -365,6 +365,79 @@ def _add_song_patterns(
     return np.array(_merge_times(times_sec, np.asarray(extra), min_sep=min_sep), dtype=float)
 
 
+
+def _song_difficulty(bpm: float, times_sec: np.ndarray, onset_env: np.ndarray) -> tuple[int, float]:
+    """Estimate automatic chart difficulty from tempo and rhythmic activity."""
+    if len(times_sec) < 2:
+        return 0, 1.0
+    gaps = np.diff(np.sort(times_sec))
+    density = float(len(times_sec) / max(times_sec[-1] - times_sec[0], 1.0))
+    short_gap = float(np.mean(gaps < max(0.16, 60.0 / max(bpm, 60.0) * 0.75)))
+    energy = float(np.mean(onset_env) / max(np.std(onset_env) + np.mean(onset_env), 1e-6))
+    score = 0.0
+    score += np.clip((bpm - 80.0) / 70.0, 0.0, 2.0)
+    score += np.clip(density / 4.0, 0.0, 2.0)
+    score += short_gap * 2.0
+    score += np.clip(energy * 2.0, 0.0, 1.5)
+    return int(np.clip(round(score), 0, 4)), score
+
+
+def _fnf_beat_grid(beat_times: np.ndarray, bpm: float, difficulty_score: float, duration_sec: float) -> np.ndarray:
+    """Create an FNF-like 4-direction beat grid with quarter/eighth/sixteenth timing."""
+    if len(beat_times) < 2 or bpm <= 0:
+        return np.array([], dtype=float)
+    step = 60.0 / bpm
+    if difficulty_score < 1.5:
+        subdivisions = 1
+    elif difficulty_score < 2.5:
+        subdivisions = 2
+    elif difficulty_score < 3.5:
+        subdivisions = 4
+    else:
+        subdivisions = 4
+    out=[]
+    for i in range(len(beat_times)-1):
+        a,b=float(beat_times[i]),float(beat_times[i+1])
+        gap=b-a
+        for k in range(subdivisions):
+            t=a + gap*k/subdivisions
+            if 0.0 < t < duration_sec-0.03:
+                out.append(t)
+    return np.array(out,dtype=float)
+
+
+def _fnf_pattern(times_sec: np.ndarray, beat_grid: np.ndarray, difficulty_score: float, min_sep: float) -> np.ndarray:
+    """Snap detected onsets to the beat grid and add restrained alternating/stream patterns."""
+    if len(beat_grid)==0:
+        return np.sort(np.unique(times_sec))
+    chosen=[]
+    for t in times_sec:
+        idx=int(np.argmin(np.abs(beat_grid-float(t))))
+        snapped=float(beat_grid[idx])
+        if abs(snapped-float(t)) <= min(0.12, min_sep*1.5):
+            chosen.append(snapped)
+    chosen.extend(float(x) for x in beat_grid if difficulty_score >= 1.5)
+    chosen=np.sort(np.unique(chosen))
+    if difficulty_score < 2.0:
+        return chosen
+    # Keep the pattern readable: avoid long runs of every subdivision.
+    max_run = 3 if difficulty_score < 3.0 else 5
+    out=[]
+    last=-1e9
+    run=0
+    for t in chosen:
+        if t-last < min_sep*0.95:
+            continue
+        if t-last < 60.0/180.0 and run >= max_run:
+            continue
+        out.append(float(t))
+        if t-last < 60.0/120.0:
+            run += 1
+        else:
+            run=0
+        last=float(t)
+    return np.array(out,dtype=float)
+
 def detect_bpm(y_perc: np.ndarray, sr: int) -> float:
     """Detect BPM. Normalises double/half-tempo estimates."""
     try:
@@ -453,13 +526,20 @@ def generate_chart_from_file(
 
     # Make the map follow the song's structure instead of applying the same
     # note rate from the first second to the last.
+    auto_level, difficulty_score = _song_difficulty(bpm, times_sec, onset_env_full)
+    # Manual difficulty remains a multiplier, while the song itself decides the base complexity.
+    manual_bias = (difficulty - 1) * 0.65
+    effective_score = float(np.clip(auto_level + manual_bias, 0.0, 4.0))
     times_sec = _song_driven_downselect(
         times_sec, times_on_full, onset_env_full, y, sr,
         difficulty, duration_sec, min_sep,
     )
+    beat_grid = _fnf_beat_grid(beat_times, bpm, effective_score, duration_sec)
+    times_sec = _fnf_pattern(times_sec, beat_grid, effective_score, min_sep)
     times_sec = _add_song_patterns(times_sec, y, sr, difficulty, min_sep)
+    times_sec = np.sort(np.unique(times_sec))
 
-    max_notes = min(15000, max(200, int(duration_sec * p["notes_per_sec"] * 1.35)))
+    max_notes = min(15000, max(200, int(duration_sec * (1.5 + effective_score * 2.2))))
     if len(times_sec) > max_notes:
         times_sec = _downselect_by_onset_strength(
             times_sec, times_on_full, onset_env_full, max_notes, min_sep=min_sep
