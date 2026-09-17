@@ -22,7 +22,7 @@ except ImportError:
     np = None
     librosa = None
 
-CHART_VERSION = 6
+CHART_VERSION = 7
 
 DIFFICULTIES = ["EASY", "NORMAL", "HARD", "EXTREME"]
 
@@ -244,6 +244,127 @@ def _lanes_from_chroma(times_sec: np.ndarray, y: np.ndarray, sr: int) -> list[in
     return lanes
 
 
+
+
+def _norm01(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0:
+        return values
+    lo = float(np.percentile(values, 10))
+    hi = float(np.percentile(values, 90))
+    if hi <= lo + 1e-9:
+        return np.ones_like(values) * 0.5
+    return np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _song_driven_downselect(
+    times_sec: np.ndarray,
+    times_on: np.ndarray,
+    onset_env: np.ndarray,
+    y: np.ndarray,
+    sr: int,
+    difficulty: int,
+    duration_sec: float,
+    min_sep: float,
+) -> np.ndarray:
+    """Pick notes per song section instead of using one global note density.
+
+    Quiet parts naturally get fewer notes while energetic sections get denser
+    patterns. The scoring combines onset strength, spectral change and RMS
+    energy, so two different songs produce noticeably different charts.
+    """
+    times_sec = np.sort(np.unique(np.asarray(times_sec, dtype=float)))
+    if len(times_sec) == 0:
+        return times_sec
+
+    hop = 512
+    onset = np.interp(times_sec, times_on, onset_env)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
+    rms_t = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+    energy = np.interp(times_sec, rms_t, rms)
+    flux_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.mean)
+    flux_t = librosa.times_like(flux_env, sr=sr, hop_length=hop)
+    flux = np.interp(times_sec, flux_t, flux_env)
+
+    score = (
+        0.50 * _norm01(onset)
+        + 0.25 * _norm01(flux)
+        + 0.25 * _norm01(energy)
+    )
+
+    # Work in short musical phrases. This prevents a loud chorus from
+    # consuming the whole note budget and leaving verses empty.
+    phrase = 4.0
+    if len(times_sec) > 1:
+        median_gap = float(np.median(np.diff(times_sec)))
+        phrase = max(2.5, min(6.0, median_gap * (16 if difficulty < 2 else 12)))
+
+    base_rates = (1.6, 3.2, 5.2, 8.0)
+    rate = base_rates[int(np.clip(difficulty, 0, 3))]
+    selected: list[float] = []
+
+    start = 0.0
+    while start < duration_sec:
+        end = min(duration_sec, start + phrase)
+        mask = (times_sec >= start) & (times_sec < end)
+        idx = np.flatnonzero(mask)
+        if len(idx):
+            sec_energy = float(np.mean(energy[idx]))
+            sec_score = float(np.mean(score[idx]))
+            # Energy controls the section's density; strong musical sections
+            # can approach the difficulty's normal rate.
+            density = 0.55 + 0.85 * max(sec_energy, sec_score)
+            target = max(1, int(round(rate * (end - start) * density)))
+            target = min(target, len(idx))
+            order = idx[np.argsort(score[idx])[::-1]]
+            picked: list[float] = []
+            for j in order:
+                t = float(times_sec[j])
+                if all(abs(t - q) >= min_sep for q in picked):
+                    picked.append(t)
+                if len(picked) >= target:
+                    break
+            selected.extend(picked)
+        start = end
+
+    return np.array(sorted(set(selected)), dtype=float)
+
+
+def _add_song_patterns(
+    times_sec: np.ndarray,
+    y: np.ndarray,
+    sr: int,
+    difficulty: int,
+    min_sep: float,
+) -> np.ndarray:
+    """Add musical subdivisions during high-intensity passages.
+
+    This creates bursts/alternation-like patterns from the actual audio rather
+    than using a fixed repeating pattern. The returned values remain timestamps
+    so the existing game format stays compatible.
+    """
+    if difficulty < 2 or len(times_sec) < 2:
+        return times_sec
+    hop = 512
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.mean)
+    tt = librosa.times_like(env, sr=sr, hop_length=hop)
+    strength = np.interp(times_sec, tt, env)
+    threshold = float(np.percentile(strength, 72))
+    extra: list[float] = []
+    for i in range(len(times_sec) - 1):
+        t0, t1 = float(times_sec[i]), float(times_sec[i + 1])
+        gap = t1 - t0
+        if gap < max(0.16, min_sep * 3) or strength[i] < threshold:
+            continue
+        # Strong hits can become a short 1/2 or 1/4-beat burst. The audio
+        # intensity decides where these happen, so songs get different shapes.
+        if difficulty >= 3 and gap > 0.30:
+            extra.extend((t0 + gap * 0.25, t0 + gap * 0.50, t0 + gap * 0.75))
+        elif gap > 0.24:
+            extra.append(t0 + gap * 0.50)
+    return np.array(_merge_times(times_sec, np.asarray(extra), min_sep=min_sep), dtype=float)
+
+
 def detect_bpm(y_perc: np.ndarray, sr: int) -> float:
     """Detect BPM. Normalises double/half-tempo estimates."""
     try:
@@ -327,14 +448,22 @@ def generate_chart_from_file(
     if len(times_sec) == 0:
         return [], duration_ms, bpm, "No rhythm detected"
 
-    max_notes = min(15000, max(200, int(duration_sec * p["notes_per_sec"])))
-
     onset_env_full = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.mean)
     times_on_full  = librosa.times_like(onset_env_full, sr=sr, hop_length=hop)
 
-    times_sec = _downselect_by_onset_strength(
-        times_sec, times_on_full, onset_env_full, max_notes, min_sep=min_sep
+    # Make the map follow the song's structure instead of applying the same
+    # note rate from the first second to the last.
+    times_sec = _song_driven_downselect(
+        times_sec, times_on_full, onset_env_full, y, sr,
+        difficulty, duration_sec, min_sep,
     )
+    times_sec = _add_song_patterns(times_sec, y, sr, difficulty, min_sep)
+
+    max_notes = min(15000, max(200, int(duration_sec * p["notes_per_sec"] * 1.35)))
+    if len(times_sec) > max_notes:
+        times_sec = _downselect_by_onset_strength(
+            times_sec, times_on_full, onset_env_full, max_notes, min_sep=min_sep
+        )
 
     lanes = _lanes_from_chroma(times_sec, y, sr)
     pattern = [(int(round(float(t) * 1000.0)), int(lanes[i])) for i, t in enumerate(times_sec)]
